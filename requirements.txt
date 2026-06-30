@@ -1,0 +1,11 @@
+python-telegram-bot
+requests
+beautifulsoup4
+lxml
+fake-useragent
+schedule
+flask
+gunicorn
+httpx
+urllib3
+streamlit

@@ -1,0 +1,7 @@
+name = "amazon-deal-bridge"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[[kv_namespaces]]
+binding = "DEALS_KV"
+id = "729170369c0b4453996e0068d7634c27"

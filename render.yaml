@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: antigravity-amazon-deal-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.0
+      - key: BRIDGE_URL
+        value: https://wild-water-d6ec.hakimkhan01h2.workers.dev
+      - key: PORT
+        value: 10000
