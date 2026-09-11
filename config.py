@@ -24,6 +24,15 @@ TELEGRAM_CHAT_ID = parse_chat_id(get_config("TELEGRAM_CHAT_ID", "-1003830805941"
 AFFILIATE_TAG = get_config("AFFILIATE_TAG", "unboxvibes03-21")
 UTM_TAG = get_config("UTM_TAG", "unboxvibes-telegram-21")
 BRIDGE_URL = get_config("BRIDGE_URL", "https://amazon-deal-bridge.hakimkhan01h2.workers.dev")
+ENABLE_BRIDGE = str(get_config("ENABLE_BRIDGE", "1")).strip().lower() in ("1", "true", "yes", "on")
+
+# Amazon API disabled - using scraping instead
+AMAZON_API_CLIENT_ID = ""
+AMAZON_API_CLIENT_SECRET = ""
+AMAZON_API_REGION = "in"
+AMAZON_API_BASE_URL = "https://api.amazon.com"
+AMAZON_API_SCOPE = "product:read"
+ENABLE_AMAZON_API = False
 
 def parse_int(val, default):
     """Extract digits from string and convert to int, fallback to default."""
@@ -36,12 +45,21 @@ def parse_int(val, default):
         return default
 
 # interval (seconds) between scraper cycles.
-# Default: 1500 seconds (25 minutes). Override via HF Secret: SCRAPE_INTERVAL_MINUTES
-SCRAPE_INTERVAL_MINUTES = parse_int(get_config("SCRAPE_INTERVAL_MINUTES", 1500), 1500)
+# Default: 1500 seconds (25 minutes). Override via HF Secret: SCRAPE_INTERVAL or SCRAPE_INTERVAL_MINUTES
+SCRAPE_INTERVAL_SECONDS = parse_int(
+    get_config("SCRAPE_INTERVAL", os.getenv("SCRAPE_INTERVAL_SECONDS", 1500)),
+    1500
+)
+SCRAPE_INTERVAL_MINUTES = SCRAPE_INTERVAL_SECONDS
 
 # interval (seconds) between individual deal posts from the queue.
 # Bot will post deals every 30 minutes (1800 seconds).
-POST_INTERVAL_SECONDS = parse_int(get_config("POST_INTERVAL_SECONDS", 1800), 1800)
+POST_INTERVAL_SECONDS = parse_int(
+    get_config("POST_INTERVAL", os.getenv("POST_INTERVAL_SECONDS", 1800)),
+    1800
+)
+
+USE_DIRECT = str(get_config("USE_DIRECT", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 DEALS_PER_RUN = parse_int(get_config("DEALS_PER_RUN", 0), 0)
 AMAZON_COUNTRY = get_config("AMAZON_COUNTRY", "in")
@@ -59,6 +77,8 @@ REJECTED_DEAL_COOLDOWN_SECONDS = parse_int(get_config("REJECTED_DEAL_COOLDOWN_SE
 # which can block future real deals. Keep this off unless you are certain
 # sent_deals contains only products actually posted to Telegram.
 STRICT_SENT_HISTORY = str(get_config("STRICT_SENT_HISTORY", "0")).strip().lower() in ("1", "true", "yes", "on")
+
+DATA_PATH = get_config("DATA_PATH", "/data")
 
 # ── GA4 Measurement Protocol ─────────────────────────────────────────────
 # Set GA4_MEASUREMENT_ID (e.g. G-XXXXXXXXXX)

@@ -19,6 +19,7 @@ import re
 import logging
 import schedule
 import ssl
+from urllib.parse import quote_plus
 
 try:
     import streamlit as st
@@ -52,6 +53,7 @@ from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, AFFILIATE_TAG, UTM_TAG,
     SCRAPE_INTERVAL_MINUTES, POST_INTERVAL_SECONDS, AMAZON_COUNTRY, MAX_PRICE,
     LOOT_THRESHOLD, MIN_DISCOUNT, LOOT_MIN_DISCOUNT, BRIDGE_URL,
+    USE_DIRECT, DATA_PATH, ENABLE_BRIDGE,
     GA4_MEASUREMENT_ID, GA4_API_SECRET, REJECTED_DEAL_COOLDOWN_SECONDS,
     STRICT_SENT_HISTORY
 )
@@ -78,11 +80,7 @@ class GhostProtocolUltra:
     def __init__(self):
         self.active_ip      = random.choice(CF_IPS)
         self.active_port    = PRIMARY_PORT
-        self.domains        = [
-            "api.telegram.org",
-            "www.amazon.in", "amazon.in",
-            "www.amazon.com", "amazon.com"
-        ]
+        self.domains        = ["api.telegram.org"]
         self.is_patched     = False
         self.ua             = UserAgent()
         self.failed_routes  = set() 
@@ -228,6 +226,41 @@ def safe_request(method, url, max_retries=6, **kwargs):
     logger.debug("safe_request failed: %s | %s", url[:60], last_error[:80])
     return None
 
+def parse_money_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        for key in ("Amount", "amount", "AmountValue", "amountValue", "Value", "value", "DisplayAmount", "displayAmount"):
+            parsed = parse_money_value(value.get(key))
+            if parsed is not None:
+                return parsed
+        return None
+    match = re.search(r"(\d[\d,]*(?:\.\d+)?)", str(value))
+    return float(match.group(1).replace(",", "")) if match else None
+
+def format_price_value(value):
+    parsed = parse_money_value(value)
+    if parsed is None:
+        return "?"
+    return str(int(parsed)) if parsed.is_integer() else f"{parsed:.2f}".rstrip("0").rstrip(".")
+
+def first_nested_value(data, paths):
+    for path in paths:
+        cur = data
+        for key in path:
+            if isinstance(cur, dict):
+                cur = cur.get(key)
+            elif isinstance(cur, list) and isinstance(key, int) and 0 <= key < len(cur):
+                cur = cur[key]
+            else:
+                cur = None
+                break
+        if cur is not None:
+            return cur
+    return None
+
 # ── GA4 MEASUREMENT PROTOCOL ─────────────────────────────────────────────
 def track_ga4_event(event_name, params, client_id="telegram_bot"):
     """Fire a GA4 Measurement Protocol event (non-blocking, best-effort)."""
@@ -257,47 +290,51 @@ def track_ga4_event(event_name, params, client_id="telegram_bot"):
 
 # ── TELEGRAM HELPER ───────────────────────────────────────────────────────
 def tg_request(endpoint, **kwargs):
-    bridge = BRIDGE_URL.strip().rstrip("/")
+    bridge = BRIDGE_URL.strip().rstrip("/") if ENABLE_BRIDGE else ""
     
-    # Connection priority based on environment:
+    # Connection priority based on environment or direct override:
+    # - USE_DIRECT=true: always use direct Telegram calls
     # - HF/Render: Bridge first (Direct is blocked)
     # - Local: Direct first (more reliable)
-    bases = []
-    if IS_HF or IS_RENDER:
-        # Cloud environments: Bridge first, then Direct as fallback
-        if bridge: bases.append(bridge)
-        bases.append("https://api.telegram.org")
+    routes = []
+    if USE_DIRECT:
+        routes = ["direct"]
     else:
-        # Local mode: Direct first, then Bridge as fallback
-        bases.append("https://api.telegram.org")
-        if bridge: bases.append(bridge)
+        if ENABLE_BRIDGE and bridge:
+            routes.append("bridge")
+        routes.append("direct")
 
-    if not bridge and (IS_HF or IS_RENDER):
-        logger.warning("⚠️ BRIDGE_URL is not set. Bot might be blocked on this platform.")
-
-    if not bases:
-        logger.error("❌ No Telegram endpoints available!")
+    if not routes:
+        logger.error("❌ No Telegram routes available!")
         return None
 
-    for base in bases:
-        is_bridge = bridge and bridge in base
-        url = f"{base}/bot{TELEGRAM_BOT_TOKEN}/{endpoint}"
-        
-        # Log which route we are trying
+    if USE_DIRECT and (IS_HF or IS_RENDER):
+        logger.warning("⚠️ USE_DIRECT enabled; forcing direct Telegram traffic even though this environment may block it.")
+
+    if not bridge and (IS_HF or IS_RENDER) and not USE_DIRECT:
+        logger.warning("⚠️ BRIDGE_URL is not set. Bot might be blocked on this platform.")
+
+    for route in routes:
+        is_bridge = route == "bridge"
+        if is_bridge:
+            url = f"{bridge}/bot{TELEGRAM_BOT_TOKEN}/{endpoint}"
+        else:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{endpoint}"
+
         logger.info("📡 TG Request via %s...", "Bridge" if is_bridge else "Direct")
-        
-        r = safe_request("POST", url, **kwargs)
+        request_kwargs = dict(kwargs)
+        request_kwargs.setdefault("timeout", 12 if is_bridge else 8)
+        request_kwargs.setdefault("max_retries", 1)
+        r = safe_request("POST", url, **request_kwargs)
         if r and r.status_code == 200:
             return r
-            
+
         status = r.status_code if r else "Timeout/Blocked"
-        logger.warning("⚠️ TG via %s failed (%s)", 
-                       "Bridge" if is_bridge else "Direct", status)
-        
-        # If bridge failed on HF/Render, rotating might help if it's a transient block
+        logger.warning("⚠️ TG via %s failed (%s)", "Bridge" if is_bridge else "Direct", status)
+
         if (IS_HF or IS_RENDER) and is_bridge:
             ghost.rotate(ghost.active_ip, ghost.active_port)
-    
+
     return None
 
 # ── EXTRACTION ────────────────────────────────────────────────────────────
@@ -318,7 +355,15 @@ def extract_price_from_block(block):
     m = re.search(r"₹\s*([\d,]+(?:\.\d+)?)", block.get_text())
     if not m:
         m = re.search(r"([\d,]+(?:\.\d+)?)", block.get_text())
-    return m.group(1).replace(",", "") if m else "?"
+    return format_price_value(m.group(1)) if m else "?"
+
+# Amazon API payload parsing removed - using web scraping instead
+
+# Amazon API removed - using web scraping instead
+def fetch_amazon_product_data(asin):
+    """Deprecated: Amazon API removed. Always returns None."""
+    return None
+
 
 def extract_product_data(soup, asin):
     # Title
@@ -348,6 +393,21 @@ def extract_product_data(soup, asin):
             if node:
                 m = re.search(r"([\d,]+(?:\.\d+)?)", node.get_text())
                 if m: price = m.group(1).replace(",", ""); break
+    if price == "?":
+        for sel in [
+            ".priceToPay .a-offscreen",
+            ".apexPriceToPay .a-offscreen",
+            "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
+            "#corePriceDisplay_mobile_feature_div .a-price .a-offscreen",
+            "#tp_price_block_total_price_ww .a-offscreen",
+            "[data-a-color='price'] .a-offscreen",
+            "span.a-price:not(.a-text-strike) .a-offscreen",
+        ]:
+            node = soup.select_one(sel)
+            if node:
+                price = format_price_value(node.get_text(" ", strip=True))
+                if price != "?":
+                    break
     
     # Original Price (MRP)
     orig = "?"
@@ -361,6 +421,18 @@ def extract_product_data(soup, asin):
         if basis:
             m = re.search(r"([\d,]+(?:\.\d+)?)", basis.get_text())
             if m: orig = m.group(1).replace(",", "")
+    if orig == "?":
+        for sel in [
+            ".a-price.a-text-price .a-offscreen",
+            "[data-a-strike='true'] .a-offscreen",
+            ".basisPrice .a-offscreen",
+            "#listPrice .a-offscreen",
+        ]:
+            node = soup.select_one(sel)
+            if node:
+                orig = format_price_value(node.get_text(" ", strip=True))
+                if orig != "?":
+                    break
     
     # Sanity: hide orig if <= current price
     try:
@@ -464,12 +536,13 @@ def extract_product_data(soup, asin):
     }
 
 # ── PERSISTENCE ────────────────────────────────────────────────────────────
-# Fix for Render: Use /data if it exists (Persistent Disk)
-DATA_BASE = "/data" if os.path.exists("/data") else "."
+# Use configured DATA_PATH if provided; otherwise fallback to /data or current folder.
+DATA_BASE = DATA_PATH if os.path.exists(DATA_PATH) else ("/data" if os.path.exists("/data") else ".")
 SENT_DEALS_FILE = os.path.join(DATA_BASE, "sent_deals.txt")
 DEAL_QUEUE_FILE = os.path.join(DATA_BASE, "deal_queue.json")  # Single definition — do NOT redefine below
 DEAL_HISTORY_FILE = os.path.join(DATA_BASE, "deal_history.json")
 REJECTED_DEALS_FILE = os.path.join(DATA_BASE, "rejected_deals.json")
+DEAL_CACHE_FILE = os.path.join(DATA_BASE, "deal_cache.json")
 MAX_HISTORY_ENTRIES = 500  # Increased to remember more deals
 
 if DATA_BASE == ".":
@@ -503,7 +576,7 @@ def load_sent_deals():
             logger.debug("Local sent-deals load failed: %s", e)
 
     # Optional remote sync from Bridge.
-    bridge_base = BRIDGE_URL.strip().rstrip("/")
+    bridge_base = BRIDGE_URL.strip().rstrip("/") if ENABLE_BRIDGE else ""
     if bridge_base:
         try:
             r = safe_request("GET", f"{bridge_base}/sent_deals", timeout=10)
@@ -554,7 +627,7 @@ def save_sent_deal(asin):
         logger.error("❌ Local Save Fail (%s): %s", asin, e)
 
     # 2. Sync to Bridge (Cloudflare KV)
-    bridge_base = BRIDGE_URL.strip().rstrip("/")
+    bridge_base = BRIDGE_URL.strip().rstrip("/") if ENABLE_BRIDGE else ""
     if bridge_base:
         try:
             # Send to bridge in background-ish (short timeout)
@@ -653,10 +726,11 @@ def load_queue():
                 if "asin_list" not in data: data["asin_list"] = []
                 if "last_post_time" not in data: data["last_post_time"] = 0
                 if "last_scrape_time" not in data: data["last_scrape_time"] = 0  # NEW: separate scrape tracker
+                if "attempts" not in data: data["attempts"] = {}
                 return data
         except Exception as e:
             logger.error("Error loading queue: %s", e)
-    return {"asin_list": [], "last_post_time": 0, "last_scrape_time": 0}
+    return {"asin_list": [], "last_post_time": 0, "last_scrape_time": 0, "attempts": {}}
 
 def save_queue(data):
     try:
@@ -664,6 +738,100 @@ def save_queue(data):
             json.dump(data, f, indent=4)
     except Exception as e:
         logger.error("Error saving queue: %s", e)
+
+def load_deal_cache():
+    if os.path.exists(DEAL_CACHE_FILE):
+        try:
+            with open(DEAL_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.debug("Error loading deal cache: %s", e)
+    return {}
+
+def save_deal_cache(data):
+    try:
+        now = time.time()
+        fresh = {
+            asin: deal for asin, deal in data.items()
+            if isinstance(deal, dict) and now - float(deal.get("cached_at", now)) < 43200
+        }
+        with open(DEAL_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(fresh, f, indent=2)
+    except Exception as e:
+        logger.debug("Error saving deal cache: %s", e)
+
+def extract_listing_card_data(html):
+    soup = BeautifulSoup(html, "lxml")
+    deals = {}
+    links = soup.select("a[href*='/dp/'], a[href*='/gp/product/']")
+
+    for link in links:
+        href = link.get("href", "")
+        match = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})", href)
+        if not match:
+            continue
+
+        asin = match.group(1).upper()
+        card = (
+            link.find_parent(attrs={"id": "gridItemRoot"}) or
+            link.find_parent(attrs={"data-asin": True}) or
+            link.find_parent("div")
+        )
+        for _ in range(4):
+            if not card:
+                break
+            if card.select_one(".a-price, .a-offscreen"):
+                break
+            card = card.find_parent("div")
+        if not card:
+            continue
+
+        price_node = card.select_one(".a-price:not(.a-text-strike) .a-offscreen") or card.select_one(".a-price .a-offscreen")
+        price = format_price_value(price_node.get_text(" ", strip=True) if price_node else None)
+        if price == "?":
+            continue
+
+        orig_node = (
+            card.select_one(".a-price.a-text-price .a-offscreen") or
+            card.select_one("[data-a-strike='true'] .a-offscreen")
+        )
+        orig = format_price_value(orig_node.get_text(" ", strip=True) if orig_node else None)
+
+        card_text = card.get_text(" ", strip=True)
+        disc_match = re.search(r"(\d+)\s*%", card_text)
+        disc_val = int(disc_match.group(1)) if disc_match else 0
+        if disc_val == 0 and orig != "?":
+            try:
+                cur = float(price)
+                mrp = float(orig)
+                if mrp > cur:
+                    disc_val = int(round(((mrp - cur) / mrp) * 100))
+            except Exception:
+                disc_val = 0
+
+        img = card.select_one("img")
+        title = (img.get("alt") or "").strip() if img else ""
+        if not title:
+            title = re.sub(r"\s+", " ", card_text).strip()[:80]
+        title = title or f"Amazon Item ({asin})"
+
+        image_url = ""
+        if img:
+            image_url = img.get("data-old-hires") or img.get("src") or ""
+
+        deals[asin] = {
+            "title": title[:80],
+            "current_price": price,
+            "original_price": orig,
+            "discount": f"{disc_val}%" if disc_val else "DEAL",
+            "discount_val": disc_val,
+            "rating": "4.2",
+            "image": image_url,
+            "cached_at": time.time(),
+        }
+
+    return deals
 
 # ── PROMO DEALS ───────────────────────────────────────────────────────────
 cached_promo_asins = set()
@@ -882,7 +1050,7 @@ def cycle_deals():
     try:
         logger.info("🔍 Scraper Cycle Start...")
         domain = "amazon.in" if AMAZON_COUNTRY == "in" else "amazon.com"
-        bridge_base = BRIDGE_URL.strip().rstrip("/")
+        bridge_base = BRIDGE_URL.strip().rstrip("/") if ENABLE_BRIDGE else ""
         
         # expanded bestseller categories per user request; each URL is
         # the `gp/bestsellers/<category>` page on Amazon.  only the ASINs
@@ -928,19 +1096,37 @@ def cycle_deals():
         targets = [f"https://www.{domain}/gp/bestsellers/{c}" for c in cats]
         
         asins = []
+        deal_cache = load_deal_cache()
         # Strategies
-        stealth = lambda u: safe_request("GET", u, headers=get_stealth_headers())
-        tunnel  = lambda u: (safe_request("GET", f"{bridge_base}/?url={u}", headers=get_stealth_headers()) 
-                             if bridge_base else None)
+        stealth = lambda u: safe_request(
+            "GET", u,
+            headers=get_stealth_headers(),
+            timeout=15,
+            max_retries=2
+        )
+        tunnel = lambda u: (
+            safe_request(
+                "GET",
+                f"{bridge_base}/?url={quote_plus(u)}",
+                headers=get_stealth_headers(),
+                timeout=15,
+                max_retries=2
+            ) if bridge_base else None
+        )
 
         strategies = [("Tunnel", tunnel), ("Stealth", stealth)] if IS_HF else [("Stealth", stealth), ("Tunnel", tunnel)]
         
         for name, caller in strategies:
+            logger.info("🔎 Trying scraper strategy: %s", name)
             # Check all categories for deals
             for url in targets:
                 try:
                     r = caller(url)
                     if r and r.status_code == 200:
+                        listing_deals = extract_listing_card_data(r.text)
+                        if listing_deals:
+                            deal_cache.update(listing_deals)
+                            logger.info("ðŸ’¾ Cached %d listing-card deals via [%s]", len(listing_deals), name)
                         found = re.findall(r"/(?:dp|gp/product|gp/slredirect/.*%2Fdp%2F)/([A-Z0-9]{10})", r.text)
                         if found:
                             unique_found = [f for f in set(found) if f not in asins]
@@ -948,8 +1134,12 @@ def cycle_deals():
                             logger.info("✅ Found %d new ASINs via [%s] in category %s", len(unique_found), name, url.split("/")[-1])
                     else:
                          logger.debug("[%s] Status %s for %s", name, r.status_code if r else "None", url[:40])
-                except Exception: continue
+                except Exception:
+                    logger.debug("[%s] Request exception for %s", name, url[:60])
+                    continue
             if asins: break # If we found enough ASINs via one strategy, stop there to avoid extra traffic
+
+        save_deal_cache(deal_cache)
         
         if not asins:
              promo_asins = get_promo_asins(limit=10)
@@ -1001,6 +1191,7 @@ def process_one_deal():
     queue_data = load_queue()
     asin_list = queue_data.get("asin_list", [])
     last_post_time = queue_data.get("last_post_time", 0)
+    attempts = queue_data.get("attempts", {})
 
     if not asin_list:
         logger.info("📭 Queue is empty. Waiting for scraper to find new deals...")
@@ -1018,101 +1209,155 @@ def process_one_deal():
     logger.info("📤 POST INTERVAL MET! Ready to post a deal. Queue has %d items.", len(asin_list))
 
     domain = "amazon.in" if AMAZON_COUNTRY == "in" else "amazon.com"
-    bridge_base = BRIDGE_URL.strip().rstrip("/")
+    bridge_base = BRIDGE_URL.strip().rstrip("/") if ENABLE_BRIDGE else ""
 
     # Load sent deals ONCE at the start and maintain in-memory set
     # to prevent repeats even within a single processing run
     sent_deals = load_sent_deals()
+    deal_cache = load_deal_cache()
 
     # Try one by one until one works or queue empty
     while asin_list:
         asin = asin_list.pop(0)
+        asin_key = asin.upper()
+        attempt_count = attempts.get(asin_key, 0)
 
         # Double check if already sent (in-memory check — updated after each save)
-        if asin.upper() in sent_deals:
+        if asin_key in sent_deals:
             logger.info("⏭️ Skip %s (Already sent — in memory or file)", asin)
             queue_data["asin_list"] = asin_list
+            queue_data["attempts"] = attempts
             save_queue(queue_data)
             continue
 
         logger.info("📦 Processing from queue: %s", asin)
 
-        p_url = f"https://www.{domain}/dp/{asin}"
-        r = None
-        fetched = False
-        resp = safe_request("GET", p_url, headers=get_stealth_headers())
-        if resp and resp.status_code == 200 and "captcha" not in resp.text.lower():
-            r = resp
-            fetched = True
+        temp_data = None
+        cached_data = deal_cache.get(asin_key)
+        if cached_data and cached_data.get("current_price") != "?":
+            temp_data = dict(cached_data)
+            logger.info("ðŸ’¾ Using cached listing-card price for %s", asin)
 
-        if not fetched and bridge_base:
-            resp = safe_request("GET", f"{bridge_base}/?url={p_url}", headers=get_stealth_headers())
+        # Skip API - use scraping instead
+        if not temp_data:
+            p_url = f"https://www.{domain}/dp/{asin}"
+            r = None
+            fetched = False
+
+            resp = None if (IS_HF or IS_RENDER) else safe_request("GET", p_url, headers=get_stealth_headers(), timeout=10, max_retries=1)
             if resp and resp.status_code == 200 and "captcha" not in resp.text.lower():
                 r = resp
                 fetched = True
+            elif resp is not None:
+                logger.debug("⛔ Direct fetch failed for %s | status=%s", asin, resp.status_code)
 
-        if fetched and r:
-            soup = BeautifulSoup(r.text, "lxml")
-            temp_data = extract_product_data(soup, asin)
-            pv = temp_data.get("current_price", "?")
-            title = temp_data.get("title", "")
+            if not fetched and bridge_base:
+                resp = safe_request("GET", f"{bridge_base}/?url={quote_plus(p_url)}", headers=get_stealth_headers(), timeout=10, max_retries=1)
+                if resp and resp.status_code == 200 and "captcha" not in resp.text.lower():
+                    r = resp
+                    fetched = True
+                elif resp is not None:
+                    logger.debug("⛔ Bridge fetch failed for %s | status=%s", asin, resp.status_code)
 
-            if is_blacklisted_title(title):
-                logger.info("⏭️ Skip %s (Blacklisted keyword match). Marking as handled.", asin)
-                save_rejected_deal(asin)
-                sent_deals.add(asin.upper())
-                queue_data["asin_list"] = asin_list
-                save_queue(queue_data)
-                continue
-
-            if pv == "?":
-                logger.warning("⚠️ No price for %s. Cooling down before retry.", asin)
-                save_rejected_deal(asin)
-                queue_data["asin_list"] = asin_list
-                save_queue(queue_data)
-                continue
-
-            if pv != "?":
+            if fetched and r:
                 try:
-                    price_val = float(str(pv).replace(",", ""))
-                    from config import MIN_DISCOUNT
-                    disc_val = temp_data.get("discount_val", 0)
-
-                    if price_val <= MAX_PRICE and disc_val >= MIN_DISCOUNT:
-                        logger.info("✅ Deal qualifies! Price: ₹%s (max: ₹%s), Discount: %s%% (min: %s%%)", 
-                                   price_val, MAX_PRICE, disc_val, MIN_DISCOUNT)
-                        if send_product_message(temp_data, asin):
-                            logger.info("🎉 DEAL POSTED SUCCESSFULLY to Telegram: %s", asin)
-                            save_sent_deal(asin)
-                            # ✅ FIX: Update in-memory set immediately so same-run duplicates are caught
-                            sent_deals.add(asin.upper())
-                            save_deal_to_history(temp_data, asin)
-                            queue_data["last_post_time"] = time.time()
-                            queue_data["asin_list"] = asin_list
-                            save_queue(queue_data)
-                            logger.info("✅ Successfully posted %s (₹%s, %s%% OFF).", asin, pv, disc_val)
-                            return True
-                        else:
-                            logger.error("❌ send_product_message returned False for %s", asin)
-                    else:
-                        reason = f"₹{pv} > ₹{MAX_PRICE}" if price_val > MAX_PRICE else f"{disc_val}% < {MIN_DISCOUNT}% OFF"
-                        logger.info("⏭️ Skip %s (%s). Cooling down before retry.", asin, reason)
-                        save_rejected_deal(asin)
+                    soup = BeautifulSoup(r.text, "lxml")
+                    temp_data = extract_product_data(soup, asin)
                 except Exception as e:
-                    logger.error("Processing Logic Error: %s", e)
-        else:
-             # If fetched but no price, or failed to fetch
-             # We still remove it from queue above (pop)
-             # Let's mark it as "attempted" so it doesn't immediate re-queue if it's broken
-             if fetched:
-                  logger.warning("⚠️ No price for %s. Cooling down before retry.", asin)
-                  save_rejected_deal(asin)
+                    logger.debug("HTML product parsing error for %s: %s", asin, e)
 
-        # If we reach here, this ASIN failed or was skipped. Update queue and continue.
+        pv = temp_data.get("current_price", "?") if temp_data else "?"
+        title = temp_data.get("title", "") if temp_data else ""
+
+        if is_blacklisted_title(title):
+            logger.info("⏭️ Skip %s (Blacklisted keyword match). Marking as handled.", asin)
+            save_rejected_deal(asin)
+            sent_deals.add(asin_key)
+            attempts.pop(asin_key, None)
+            queue_data["asin_list"] = asin_list
+            queue_data["attempts"] = attempts
+            save_queue(queue_data)
+            continue
+
+        if pv == "?":
+            attempt_count += 1
+            has_detail_page = bool(temp_data and title and not title.startswith(f"Amazon Item ({asin})"))
+            if (IS_HF or IS_RENDER) and not has_detail_page:
+                logger.warning("No product details for %s in hosted mode. Cooling down instead of requeueing.", asin)
+                save_rejected_deal(asin)
+                attempts.pop(asin_key, None)
+            elif attempt_count < 2:
+                logger.warning("⚠️ No price for %s. Requeueing for another try (%d/2).", asin, attempt_count)
+                attempts[asin_key] = attempt_count
+                asin_list.append(asin)
+            else:
+                logger.warning("⚠️ No price for %s after %d tries. Cooling down.", asin, attempt_count)
+                save_rejected_deal(asin)
+                attempts.pop(asin_key, None)
+            queue_data["asin_list"] = asin_list
+            queue_data["attempts"] = attempts
+            save_queue(queue_data)
+            continue
+
+        try:
+            price_val = float(str(pv).replace(",", ""))
+            from config import MIN_DISCOUNT
+            disc_val = temp_data.get("discount_val", 0)
+
+            if price_val <= MAX_PRICE and disc_val >= MIN_DISCOUNT:
+                logger.info("✅ Deal qualifies! Price: ₹%s (max: ₹%s), Discount: %s%% (min: %s%% OFF)", 
+                           price_val, MAX_PRICE, disc_val, MIN_DISCOUNT)
+                if send_product_message(temp_data, asin):
+                    logger.info("🎉 DEAL POSTED SUCCESSFULLY to Telegram: %s", asin)
+                    save_sent_deal(asin)
+                    sent_deals.add(asin_key)
+                    attempts.pop(asin_key, None)
+                    save_deal_to_history(temp_data, asin)
+                    queue_data["last_post_time"] = time.time()
+                    queue_data["asin_list"] = asin_list
+                    queue_data["attempts"] = attempts
+                    save_queue(queue_data)
+                    logger.info("✅ Successfully posted %s (₹%s, %s%% OFF).", asin, pv, disc_val)
+                    return True
+                else:
+                    attempt_count += 1
+                    if attempt_count < 3:
+                        logger.warning("❌ send_product_message failed for %s. Requeueing (%d/3).", asin, attempt_count)
+                        attempts[asin_key] = attempt_count
+                        asin_list.append(asin)
+                    else:
+                        logger.error("❌ send_product_message failed for %s after %d tries. Cooling down.", asin, attempt_count)
+                        save_rejected_deal(asin)
+                        attempts.pop(asin_key, None)
+            else:
+                reason = f"₹{pv} > ₹{MAX_PRICE}" if price_val > MAX_PRICE else f"{disc_val}% < {MIN_DISCOUNT}% OFF"
+                logger.info("⏭️ Skip %s (%s). Cooling down before retry.", asin, reason)
+                save_rejected_deal(asin)
+                attempts.pop(asin_key, None)
+        except Exception as e:
+            logger.error("Processing Logic Error: %s", e)
+            attempt_count += 1
+            if attempt_count < 3:
+                logger.warning("⚠️ Processing error for %s. Requeueing (%d/3).", asin, attempt_count)
+                attempts[asin_key] = attempt_count
+                asin_list.append(asin)
+            else:
+                logger.error("⚠️ Processing error for %s after %d tries. Cooling down.", asin, attempt_count)
+                save_rejected_deal(asin)
+                attempts.pop(asin_key, None)
+
         queue_data["asin_list"] = asin_list
+        queue_data["attempts"] = attempts
         save_queue(queue_data)
         time.sleep(2)
 
+        queue_data["asin_list"] = asin_list
+        queue_data["attempts"] = attempts
+        save_queue(queue_data)
+        time.sleep(2)
+
+    queue_data["attempts"] = attempts
+    save_queue(queue_data)
     return False
 
 # ── WORKER ────────────────────────────────────────────────────────────────
@@ -1164,21 +1409,24 @@ def start_bot_worker():
             queue_empty = not queue_data.get("asin_list")
             interval_met = elapsed_since_last_scrape >= scrape_interval_sec
 
+            if queue_empty and not interval_met:
+                logger.info("🔍 Queue is empty. Triggering immediate scrape on restart/reset.")
+                interval_met = True
+
             if interval_met:
                 if queue_empty:
-                    logger.info("🔍 Queue empty and scrape interval met. Starting cycle...")
+                    logger.info("🔍 Queue empty. Starting cycle...")
                 else:
                     logger.info("🕒 Scrape interval met (%d sec). Starting cycle...", SCRAPE_INTERVAL_MINUTES)
                 count = cycle_deals()
-                # ✅ FIX: Update last_scrape_time after every scrape attempt
                 queue_data = load_queue()  # reload after cycle_deals modifies it
                 queue_data["last_scrape_time"] = time.time()
                 save_queue(queue_data)
                 logger.info("🕒 Next scrape in %d seconds.", SCRAPE_INTERVAL_MINUTES)
-            elif queue_empty:
+            elif not queue_empty:
                 remaining = int(scrape_interval_sec - elapsed_since_last_scrape)
                 if remaining < 60 or remaining % 300 <= 5:
-                    logger.info("📭 Queue empty. Next scrape in %d seconds.", max(remaining, 0))
+                    logger.info("📭 Queue pending. Next scrape in %d seconds.", max(remaining, 0))
 
             # 3. Frequent polling sleep (5 seconds for responsive behavior)
             time.sleep(5)
@@ -1230,15 +1478,32 @@ def run_health_check():
         logger.error("❌ Health Check Server failed: %s", e)
 
 # ── STREAMLIT MAIN ──────────────────────────────────────────────────────────────────
-@st.cache_resource
-def start_singleton_worker():
-    logger.info("🧵 Starting Global Bot Worker Thread...")
+if HAS_STREAMLIT:
+    st_cache_resource = st.cache_resource
+else:
+    def st_cache_resource(func):
+        return func
+
+
+def initialize_runtime():
+    global _worker_initialized
+    if _worker_initialized:
+        return True
+
+    _worker_initialized = True
+    logger.info("🧵 Starting bot worker thread for production/runtime startup...")
     t = threading.Thread(target=start_bot_worker, daemon=True)
     t.start()
     return True
 
+@st_cache_resource
+def start_singleton_worker():
+    return initialize_runtime()
+
 if IS_STREAMLIT_RUN:
     start_singleton_worker()
+else:
+    initialize_runtime()
     
     if status_placeholder:
         status_placeholder.success("✅ Resilience v34 Active.")
@@ -1251,15 +1516,11 @@ if IS_STREAMLIT_RUN:
 # ── HEADLESS / TERMINAL MODE ──────────────────────────────────────────────
 if __name__ == "__main__" and not IS_STREAMLIT_RUN:
     logger.info("🖥️ Headless Mode Start. Version: v34")
-    
-    # Start Bot Worker in BACKGROUND
-    bot_thread = threading.Thread(target=start_bot_worker, daemon=True)
-    bot_thread.start()
-    
-    # Start Health Check Server in MAIN THREAD (Blocks for Render)
-    if HAS_FLASK:
+    initialize_runtime()
+
+    if os.getenv("RUN_DEV_SERVER", "0").strip().lower() in ("1", "true", "yes", "on") and HAS_FLASK:
         run_health_check()
     else:
-        logger.error("❌ Flask missing! Bot will run but Render port scan will FAIL.")
-        # If no flask, we must keep the main thread alive anyway
-        bot_thread.join()
+        logger.info("🛣️ Production server is expected to run via Gunicorn/Uvicorn; keeping the process alive.")
+        while True:
+            time.sleep(60)

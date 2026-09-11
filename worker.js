@@ -51,22 +51,38 @@ export default {
         return new Response("Bridge Active ✅ | KV Supported", { status: 200 });
       }
 
-      // ===== STEALTH HEADERS (ANTI BLOCK) =====
-      const headers = new Headers(request.headers);
-      headers.set(
-        "User-Agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121 Safari/537.36"
-      );
-      headers.set("Accept-Language", "en-US,en;q=0.9");
-      headers.set("Cache-Control", "no-cache");
+      // ===== CLEAN UPSTREAM HEADERS =====
+      const headers = new Headers();
+      const contentType = request.headers.get("content-type");
+      if (contentType) headers.set("content-type", contentType);
+
+      if (targetUrl.includes("api.telegram.org")) {
+        headers.set("User-Agent", "TelegramDealBot/1.0");
+      } else {
+        headers.set(
+          "User-Agent",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121 Safari/537.36"
+        );
+        headers.set("Accept-Language", "en-US,en;q=0.9");
+        headers.set("Cache-Control", "no-cache");
+      }
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
 
       // ===== FORWARD REQUEST =====
-      const response = await fetch(targetUrl, {
-        method: request.method,
-        headers: headers,
-        body: request.method === "GET" ? null : await request.arrayBuffer(),
-        redirect: "follow"
-      });
+      let response;
+      try {
+        response = await fetch(targetUrl, {
+          method: request.method,
+          headers: headers,
+          body: request.method === "GET" ? null : await request.arrayBuffer(),
+          redirect: "follow",
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
 
       const newResponse = new Response(response.body, response);
       newResponse.headers.set("Access-Control-Allow-Origin", "*");

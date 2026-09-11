@@ -3,11 +3,15 @@ services:
     name: antigravity-amazon-deal-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: gunicorn app:app --workers 2 --timeout 120
     envVars:
       - key: PYTHON_VERSION
         value: 3.10.0
       - key: BRIDGE_URL
         value: https://wild-water-d6ec.hakimkhan01h2.workers.dev
+      - key: ENABLE_BRIDGE
+        value: "1"
+      - key: USE_DIRECT
+        value: "0"
       - key: PORT
         value: 10000
