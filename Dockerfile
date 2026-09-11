@@ -4,7 +4,7 @@ FROM python:3.11-slim
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-ENV PORT=7860
+ENV PORT=10000
 # Set work directory
 WORKDIR /app
 
@@ -24,7 +24,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose the health check port
-EXPOSE 7860
+EXPOSE 10000
 
-# Command to run the application
-CMD ["python", "app.py"]
+# Gunicorn serves the Flask health endpoint while the bot worker runs in its
+# background thread during module initialization.
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-10000} --workers 1 --timeout 120 app:app"]
