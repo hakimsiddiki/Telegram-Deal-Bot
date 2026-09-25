@@ -59,7 +59,9 @@ POST_INTERVAL_SECONDS = parse_int(
     1800
 )
 
-USE_DIRECT = str(get_config("USE_DIRECT", "0")).strip().lower() in ("1", "true", "yes", "on")
+# Local machines should prefer direct Telegram calls by default.
+# Bridge-first is useful on hosting platforms, but it can silently block posting on a normal PC run.
+USE_DIRECT = str(get_config("USE_DIRECT", "1")).strip().lower() in ("1", "true", "yes", "on")
 
 DEALS_PER_RUN = parse_int(get_config("DEALS_PER_RUN", 0), 0)
 AMAZON_COUNTRY = get_config("AMAZON_COUNTRY", "in")
